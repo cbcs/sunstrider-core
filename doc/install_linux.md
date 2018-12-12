@@ -11,7 +11,7 @@
 
 4. Minimal boost version is 1.62
 
-5. sudo apt-get install clang-7 make cmake libmysql++-dev openssl libssl-dev zlib1g-dev libtool libncurses5-dev libmariadbclient-dev patch build-essential mariadb-server mariadb-client git libreadline-dev libbz2-1.0 libbz2-dev libboost-dev libboost-thread-dev libboost-system-dev libboost-filesystem-dev libboost-program-options-dev libboost-regex-dev libboost-iostreams-dev 
+5. sudo apt-get install clang-7 make cmake libmariadb++-dev openssl libssl-dev zlib1g-dev libtool libncurses5-dev libmariadbclient-dev patch build-essential mariadb-server mariadb-client git libreadline-dev libbz2-1.0 libbz2-dev libboost-dev libboost-thread-dev libboost-system-dev libboost-filesystem-dev libboost-program-options-dev libboost-regex-dev libboost-iostreams-dev 
 
 [mariadbrepository]:
 https://downloads.mariadb.org/mariadb/repositories/
@@ -66,10 +66,6 @@ https://trinitycore.atlassian.net/wiki/spaces/tc/pages/2130092/Databases+Install
 
 <!----------------------------------------------------------------------------->
 ## Extracting maps, vmaps and dbc
-
-You can skip this step by downloading [the already extracted data folders][githubdata] and extracting them into your `<root_install_folder>/data` folder.
-
-Otherwise, if those files were missing, outdated, if if you want to do it by yourself, here are instructions to extract them:
 
 1. If everything compiled correctly, the following binaries should have been created in your `<root_install_folder>/bin` folder:  
 

@@ -2444,10 +2444,6 @@ void Spell::EffectTriggerSpell(uint32 effIndex)
         && effectHandleMode != SPELL_EFFECT_HANDLE_LAUNCH)
         return;
 
-    // Prevent triggering spells here if spell has a charge effect (handled in ChargeMovementGenerator)
-    if ((m_spellInfo->Effects[0].Effect == SPELL_EFFECT_CHARGE || m_spellInfo->Effects[1].Effect == SPELL_EFFECT_CHARGE || m_spellInfo->Effects[2].Effect == SPELL_EFFECT_CHARGE))
-        return;
-    
     uint32 triggered_spell_id = m_spellInfo->Effects[effIndex].TriggerSpell;
 
     // special cases
@@ -6594,13 +6590,23 @@ void Spell::EffectQuestComplete(uint32 i)
     if (effectHandleMode != SPELL_EFFECT_HANDLE_HIT_TARGET)
         return;
 
-    if(m_caster->GetTypeId() != TYPEID_PLAYER)
+    if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
         return;
+    Player* player = unitTarget->ToPlayer();
 
-    Player *_player = m_caster->ToPlayer();
+    uint32 questId = m_spellInfo->Effects[i].MiscValue;
+    if (questId)
+    {
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest)
+            return;
 
-    uint32 quest_id = m_spellInfo->Effects[i].MiscValue;
-    _player->AreaExploredOrEventHappens(quest_id);
+        uint16 logSlot = player->FindQuestSlot(questId);
+        if (logSlot < MAX_QUEST_LOG_SIZE)
+            player->AreaExploredOrEventHappens(questId);
+        else if (quest->HasFlag(QUEST_FLAGS_TRACKING))  // Check if the quest is used as a serverside flag.
+            player->SetRewardedQuest(questId);          // If so, set status to rewarded without broadcasting it to client.
+    }
 }
 
 void Spell::EffectSelfResurrect(uint32 i)
@@ -6711,34 +6717,9 @@ void Spell::EffectCharge(uint32 i)
 
     if (effectHandleMode == SPELL_EFFECT_HANDLE_HIT_TARGET )
     {
-        //TODO: Why is this handled here?
-        uint32 triggeredSpellId = 0;
-        switch (i) {
-        case 0:
-            if (m_spellInfo->Effects[1].Effect == SPELL_EFFECT_TRIGGER_SPELL)
-                triggeredSpellId = m_spellInfo->Effects[1].TriggerSpell;
-            if (m_spellInfo->Effects[2].Effect == SPELL_EFFECT_TRIGGER_SPELL)
-                triggeredSpellId = m_spellInfo->Effects[2].TriggerSpell;
-            break;
-        case 1:
-            if (m_spellInfo->Effects[0].Effect == SPELL_EFFECT_TRIGGER_SPELL)
-                triggeredSpellId = m_spellInfo->Effects[0].TriggerSpell;
-            if (m_spellInfo->Effects[2].Effect == SPELL_EFFECT_TRIGGER_SPELL)
-                triggeredSpellId = m_spellInfo->Effects[2].TriggerSpell;
-            break;
-        case 2:
-            if (m_spellInfo->Effects[0].Effect == SPELL_EFFECT_TRIGGER_SPELL)
-                triggeredSpellId = m_spellInfo->Effects[0].TriggerSpell;
-            if (m_spellInfo->Effects[1].Effect == SPELL_EFFECT_TRIGGER_SPELL)
-                triggeredSpellId = m_spellInfo->Effects[1].TriggerSpell;
-            break;
-        }
         // not all charge effects used in negative spells
         if (!m_spellInfo->IsPositive() && _unitCaster->GetTypeId() == TYPEID_PLAYER)
             _unitCaster->Attack(target, true);
-
-        if(triggeredSpellId)
-            _unitCaster->CastSpell(target, triggeredSpellId, TRIGGERED_FULL_MASK);
     }
 }
 

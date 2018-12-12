@@ -465,7 +465,6 @@ enum RealmZone
 
 enum WowPatch
 {
-    WOW_PATCH_MIN   = 0,
     WOW_PATCH_200   = 0,
     WOW_PATCH_210   = 1,
     WOW_PATCH_220   = 2,
@@ -477,7 +476,8 @@ enum WowPatch
     WOW_PATCH_322   = 8,
     WOW_PATCH_330   = 9,
     WOW_PATCH_335   = 10,
-    WOW_PATCH_MAX   = 10,
+    WOW_PATCH_MIN   = WOW_PATCH_200,
+    WOW_PATCH_MAX   = WOW_PATCH_335
 };
 
 struct AutoAnnounceMessage
@@ -752,6 +752,8 @@ class TC_GAME_API World
         //used World DB version
         void LoadDBVersion();
         char const* GetDBVersion() { return m_DBVersion.c_str(); }
+
+        void ResetEventSeasonalQuests(uint16 event_id);
 
         uint32 GetCurrentQuestForPool(uint32 poolId);
         bool IsQuestInAPool(uint32 questId);

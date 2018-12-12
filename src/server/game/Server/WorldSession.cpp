@@ -141,7 +141,7 @@ _clientControl(this)
 /// WorldSession destructor
 WorldSession::~WorldSession()
 {
-    GetClientControl().ResetActiveMover(true); //must be before player logout
+    GetClientControl().PlayerDisconnect(); //must be before player logout
     GetClientControl().ResolveAllPendingChanges();
 
     ///- unload player if not unloaded
@@ -992,15 +992,20 @@ void WorldSession::ReadAddon(ByteBuffer& addonInfo)
         return;
 
     std::string addonName;
-    uint8 enabled;
+    uint8 enabled = true;
     uint32 crc, unk1;
     ClientBuild build = GetClientBuild();
 
     addonInfo >> addonName;
-
+#ifdef LICH_KING
     addonInfo >> enabled >> crc >> unk1;
+#else
+    //"Huf: the tbc client only seems to be sending info for the standard addons"
+    uint8 unk2;
+    addonInfo >> crc >> unk1 >> unk2;
+#endif
 
-    TC_LOG_TRACE("misc", "ADDON: Name: %s, Enabled: 0x%x, CRC: 0x%x, Unknown2: 0x%x", addonName.c_str(), enabled, crc, unk1);
+    TC_LOG_TRACE("misc", "ADDON: Name: %s, Enabled: 0x%x, CRC: 0x%x, Unknown1: 0x%x", addonName.c_str(), enabled, crc, unk1);
 
     AddonInfo addon(addonName, enabled, crc, 2, true, build);
 

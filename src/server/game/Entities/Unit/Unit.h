@@ -309,6 +309,17 @@ enum DamageEffectType : unsigned int
     TOTAL_DAMAGE_EFFECT_TYPE,
 };
 
+enum SpellPartialResist
+{ 
+    SPELL_PARTIAL_RESIST_NONE = 0,  // 0%, full hit
+    SPELL_PARTIAL_RESIST_PCT_25,    // 25%
+    SPELL_PARTIAL_RESIST_PCT_50,    // 50%
+    SPELL_PARTIAL_RESIST_PCT_75,    // 75%
+    SPELL_PARTIAL_RESIST_PCT_100,   // 100%, full resist
+
+    NUM_SPELL_PARTIAL_RESISTS,
+};
+
 enum UnitTypeMask : int
 {
     UNIT_MASK_NONE                  = 0x00000000,
@@ -1298,11 +1309,17 @@ class TC_GAME_API Unit : public WorldObject
         void       DeleteCharmInfo();
 
         // returns the player that this unit is BEING CONTROLLED BY
-        ClientControl* GetPlayerMovingMe() const { return m_playerMovingMe; }
-        // only set for direct client control (possess effects, vehicles and similar)
-        ClientControl* m_playerMovingMe;
+        ClientControl* GetPlayerMovingMe() const;
+        // Client currently moving me (client may or may not have completed mover activation process) / Always matches _serverActiveMover
+        std::weak_ptr<ClientControl> m_playerMovingMe;
+        std::shared_ptr<Unit> _this; //used to delete references to this class in other classes when Unit gets destroyed
+        // This unit is currently mover suppressed. (we may be suppressed with no player controlling us currently)
+        bool m_moverSuppressed;
+        void UpdateSuppressedMover();
+        bool IsMoverSuppressed() const { return m_moverSuppressed; }
+
         // reflects direct client control (examples: a player MC another player or a creature (possess effects). a player takes control of a vehicle. etc...)
-        bool IsMovedByPlayer() const { return m_playerMovingMe != nullptr; }
+        bool IsMovedByPlayer() const;
         SharedVisionList const& GetSharedVisionList() { return m_sharedVision; }
         void AddPlayerToVision(Player* plr);
         void RemovePlayerFromVision(Player* plr);
@@ -1780,7 +1797,7 @@ class TC_GAME_API Unit : public WorldObject
 
         static bool IsDamageReducedByArmor(SpellSchoolMask damageSchoolMask, SpellInfo const* spellInfo = nullptr, int8 effIndex = -1);
         static uint32 CalcArmorReducedDamage(Unit const* attacker, Unit* pVictim, const uint32 damage, SpellInfo const* spellInfo, WeaponAttackType attackType);
-        static uint32 CalcSpellResistedDamage(Unit const* attacker, Unit* victim, uint32 damage, SpellSchoolMask schoolMask, SpellInfo const* spellInfo);
+        static uint32 CalcSpellResistedDamage(DamageInfo const& info);
         static void CalcAbsorbResist(DamageInfo& damageInfo);
 
         void  UpdateSpeed(UnitMoveType mtype);

@@ -1,5 +1,6 @@
 #include "ClientControl.h"
 #include "MovementPacketSender.h"
+#include "UpdateTime.h"
 
 ClientControl::ClientControl(WorldSession* session) :
     _owner(session),
@@ -7,31 +8,20 @@ ClientControl::ClientControl(WorldSession* session) :
     lastMoveClientTimestamp(0),
     lastMoveServerTimestamp(0),
     _pendingActiveMoverSplineId(0),
-    _activeMover(nullptr),
-    _releaseMoverTimeout(0)
-{}
+    _activeMover(),
+    _serverActiveMover()
+{
+    _this = std::shared_ptr<ClientControl>(this, [](ClientControl*) {});
+}
 
 void ClientControl::Update(uint32 diff)
 {
     CheckPendingMovementAcks();
-
-    if (_releaseMoverTimeout > 0)
-    {
-        if (diff >= _releaseMoverTimeout)
-        {
-            TC_LOG_DEBUG("movement", "Player %s (%u) did not ack the mover change fast enough and was kicked",
-                _owner->GetPlayer()->GetName().c_str(), _owner->GetPlayer()->GetGUID().GetCounter());
-
-            _owner->KickPlayer();
-        }
-        else
-            _releaseMoverTimeout -= diff;
-    }
 }
 
 void ClientControl::ResolveAllPendingChanges()
 {
-    if (!_activeMover)
+    if (_activeMover.expired())
         return;
 
     TC_LOG_TRACE("movement", "Resolve all pending change for player %s (%u) (for all controlled units)",
@@ -61,33 +51,19 @@ bool ClientControl::IsAllowedToMove(ObjectGuid guid, bool log /*= true*/)
 
 Unit* ClientControl::GetAllowedActiveMover() const
 {
-    if (_activeMover && _allowedClientMove.find(_activeMover->GetGUID()) != _allowedClientMove.end())
-        return _activeMover;
-    else
-        return nullptr;
+    Unit* activeMover = _activeMover.lock().get();
+    if (activeMover && _allowedClientMove.find(activeMover->GetGUID()) != _allowedClientMove.end() && !activeMover->IsMoverSuppressed())
+        return activeMover;
+
+    return nullptr;
 }
 
-void ClientControl::ResetActiveMover(bool onDelete /*= false*/)
+void ClientControl::InitActiveMover(Unit* activeMover)
 {
-    Unit* previousMover = _activeMover;
-    if (_activeMover)
-        if (_activeMover->m_playerMovingMe == this)
-            _activeMover->m_playerMovingMe = nullptr;
-
-    _activeMover = nullptr;
-
-    if (onDelete)
-        return;
-
-    //Only code not on deletion here
-    _owner->anticheat.OnPlayerMoverChanged(previousMover, nullptr);
-}
-
-void ClientControl::InitActiveMover(Player* activeMover)
-{
-    _activeMover = nullptr; //May have one from a previous session
+    _activeMover.reset();
+    _serverActiveMover.unit = activeMover->_this;
+    activeMover->m_playerMovingMe = _this;
     _allowedClientControl.insert(activeMover->GetGUID());
-    //activeMover->m_playerMovingMe = this;
     //Client will send CMSG_SET_ACTIVE_MOVER when joining a map
 }
 
@@ -95,68 +71,42 @@ void ClientControl::AllowMover(Unit* mover)
 {
     _allowedClientMove.insert(mover->GetGUID());
     _pendingActiveMoverSplineId = 0;
-    mover->m_playerMovingMe = this;
 }
 
 void ClientControl::DisallowMover(Unit* mover)
 {
     _allowedClientMove.erase(mover->GetGUID());
-    if (mover->m_playerMovingMe == this)
-        mover->m_playerMovingMe = nullptr;
     ResolveAllPendingChanges();
 }
 
-//Here is the active mover sequence:
-// - Server tell the unit of his new active mover with SMSG_CLIENT_CONTROL_UPDATE 
-// - Client respond with CMSG_SET_ACTIVE_MOVER to enable this mover
-// - We send a spline on current unit position to transfer correct movement info
-// - Client respond CMSG_MOVE_SPLINE_DONE, transfer is complete
-// The spline step is necessary because when mover changed, it's possible that the client controlling it has not yet received 
-// the move flags of the mover that were set just before he took control. This is not possible when we keep the same mover since
-// those changes must be acked by client. Also, same problem is present with speed changes.
-void ClientControl::SetActiveMover(Unit* activeMover)
+void ClientControl::UpdateTakeControl(Unit* target, bool allowMove)
 {
-    //Resolve all pending changes for this unit before taking control
-    if (ClientControl* session = activeMover->GetPlayerMovingMe())
-        session->DisallowMover(activeMover);
-
-    DisallowMover(activeMover);
-
-    _activeMover = activeMover;
-
-#ifdef TODOMOV
-    _pendingActiveMoverSplineId = activeMover->StopMovingOnCurrentPos(); //Send spline movement before allowing move
-    if (_pendingActiveMoverSplineId == 0)
+    bool const targetSuppressed = target->IsMoverSuppressed();
+    if (allowMove)
     {
-        TC_LOG_FATAL("movement", "WorldSession::SetActiveMover: player %s with pending mover %s, FAILED to start spline movement",
-            _owner->GetPlayer()->GetName().c_str(), _activeMover->GetGUID().ToString().c_str());
+        if (_serverActiveMover.unit.lock().get() == target)
+            return; //we already have control
 
-        //Unit will get stuck. Shouldn't ever happen in current impl.
-        DEBUG_ASSERT(false);
+        _serverActiveMover = ServerActiveMover(target->_this, targetSuppressed);
+        target->m_playerMovingMe = _this;
+        if (targetSuppressed)
+            return; //don't send control update, we need to delay it in this case
+    }
+    else if (/*!allowMove &&*/ _serverActiveMover.unit.lock().get() == target)
+    {
+        _serverActiveMover.Reset();
+        target->m_playerMovingMe.reset();
     }
 
-    TC_LOG_TRACE("movement", "Received CMSG_SET_ACTIVE_MOVER for player %s with pending mover %s (%s), now sending the spline movement (id %u)",
-        _owner->GetPlayer()->GetName().c_str(), _activeMover->GetName().c_str(), _activeMover->GetGUID().ToString().c_str(), _pendingActiveMoverSplineId);
-#else
-    if (IsAllowedToTakeControl(_activeMover->GetGUID()))
-    {
-        AllowMover(_activeMover);
-        TC_LOG_TRACE("movement", "WorldSession::SetActiveMover: Enabling move of unit %s (%s) to player %s (%s)",
-            _activeMover->GetName().c_str(), _activeMover->GetGUID().ToString().c_str(), _owner->GetPlayer()->GetName().c_str(), _owner->GetPlayer()->GetName().c_str());
-    }
-    else
-    {
-        TC_LOG_ERROR("movement", "WorldSession::SetActiveMover: Failed enabling move of unit %s (%s) to player %s (%s), pending spline id is correct but player is not allowed to take control anymore",
-            _activeMover->GetName().c_str(), _activeMover->GetGUID().ToString().c_str(), _owner->GetPlayer()->GetName().c_str(), _owner->GetPlayer()->GetName().c_str());
-    }
-#endif
+    SetClientControl(target, allowMove);
 }
 
 void ClientControl::SetClientControl(Unit* target, bool allowMove)
 {
-    // still affected by some aura that shouldn't allow control, only allow on last such aura to be removed
-    if (allowMove && target->HasUnitState(UNIT_STATE_CANT_CLIENT_CONTROL))
-        return;
+    std::string action = allowMove ? "Sending" : "Removing";
+    std::string to = allowMove ? "to" : "from";
+    TC_LOG_TRACE("movement", "SMSG_CLIENT_CONTROL_UPDATE: %s control of unit %s %s client of %s",
+        action.c_str(), target->GetName().c_str(), to.c_str(), _owner->GetPlayer()->GetName().c_str());
 
     WorldPacket data(SMSG_CLIENT_CONTROL_UPDATE, target->GetPackGUID().size() + 1);
     data << target->GetPackGUID();
@@ -165,25 +115,6 @@ void ClientControl::SetClientControl(Unit* target, bool allowMove)
 
     //sun: We told the client to change active mover but there will be some time before he respond
     //We delay setting active mover until the client actually tells us he takes control with CMSG_SET_ACTIVE_MOVER
-
-    std::string action = allowMove ? "Sending" : "Removing";
-    std::string to = allowMove ? "to" : "from";
-    TC_LOG_TRACE("movement", "SMSG_CLIENT_CONTROL_UPDATE: %s control of unit %s %s client of %s",
-        action.c_str(), target->GetName().c_str(), to.c_str(), _owner->GetPlayer()->GetName().c_str());
-
-    if (allowMove)
-    {
-        if (target == _owner->GetPlayer())
-            _owner->GetPlayer()->SetGuidValue(PLAYER_FARSIGHT, ObjectGuid::Empty);
-        else
-            _owner->GetPlayer()->SetViewpoint(target, true); //Setting PLAYER_FARSIGHT will trigger CMSG_FAR_SIGHT from client, which will have no effect here since we already set vision at this point
-
-        //if we send client control, to this player, the player should be allowed to take control of it when calling this function
-        DEBUG_ASSERT(_allowedClientControl.find(target->GetGUID()) != _allowedClientControl.end());
-    }
-    else if (_owner->GetPlayer()->GetGuidValue(PLAYER_FARSIGHT))
-        _owner->GetPlayer()->SetViewpoint(target, false);
-
 }
 
 ClientControl::PendingChangePair ClientControl::PopPendingMovementChange()
@@ -245,7 +176,7 @@ bool ClientControl::HasPendingMovementChange(uint32 counter, uint16 opcode, Obje
 
     if (!found)
     {
-        TC_LOG_ERROR("network", "Received ack with existing counter %u but incorrect type %u or guid %s or apply %u (expected type %u and guid %s and apply %u)",
+        TC_LOG_ERROR("movement", "Received ack with existing counter %u but incorrect type %u or guid %s or apply %u (expected type %u and guid %s and apply %u)",
             counter, type, guid.ToString().c_str(), uint8(apply), change.movementChangeType, change.guid.ToString().c_str(), uint8(change.apply));
     }
     return found;
@@ -273,7 +204,7 @@ void ClientControl::CheckPendingMovementAcks()
         return;
 
     PlayerMovementPendingChange const& oldestChangeToAck = _pendingMovementChanges.front().second;
-    if (map->GetGameTimeMS() > oldestChangeToAck.time + sWorld->getIntConfig(CONFIG_PENDING_MOVE_CHANGES_TIMEOUT))
+    if (map->GetGameTimeMS() > oldestChangeToAck.time + sWorld->getIntConfig(CONFIG_PENDING_MOVE_CHANGES_TIMEOUT) + sWorldUpdateTime.GetLastUpdateTime()) //added update time to compenstate for big server lag or debugger usage
     {
         /*
         when players are teleported from one corner of a map to an other (example: from Dragonblight to the entrance of Naxxramas, both in the same map: Northend),
@@ -293,9 +224,76 @@ void ClientControl::CheckPendingMovementAcks()
     }
 }
 
+//Following logic is partially disabled with #ifdef TODOMOV:
+// Need to fix: https://github.com/ValorenWoW/sunstrider-core/pull/67
+//
+//Here is the active mover sequence:
+// - Server tell the unit of his new active mover with SMSG_CLIENT_CONTROL_UPDATE 
+// - Client respond with CMSG_SET_ACTIVE_MOVER to enable this mover
+// - We send a spline on current unit position to transfer correct movement info
+// - Client respond CMSG_MOVE_SPLINE_DONE, transfer is complete
+// The spline step is necessary because when mover changed, it's possible that the client controlling it has not yet received 
+// the move flags of the mover that were set just before he took control. This is not possible when we keep the same mover since
+// those changes must be acked by client. Also, same problem is present with speed changes.
+void ClientControl::SetActiveMover(Unit* activeMover)
+{
+    //Resolve all pending changes for this unit before taking control
+    if (ClientControl* session = activeMover->GetPlayerMovingMe())
+        session->DisallowMover(activeMover);
+
+    DisallowMover(activeMover);
+
+    _activeMover = activeMover->_this;
+
+#ifdef TODOMOV
+    _pendingActiveMoverSplineId = activeMover->StopMovingOnCurrentPos(); //Send spline movement before allowing move
+    if (_pendingActiveMoverSplineId == 0)
+    {
+        TC_LOG_FATAL("movement", "WorldSession::SetActiveMover: player %s with pending mover %s, FAILED to start spline movement",
+            _owner->GetPlayer()->GetName().c_str(), _activeMover->GetGUID().ToString().c_str());
+
+        //Unit will get stuck. Shouldn't ever happen in current impl.
+        DEBUG_ASSERT(false);
+    }
+
+    TC_LOG_TRACE("movement", "Received CMSG_SET_ACTIVE_MOVER for player %s with pending mover %s (%s), now sending the spline movement (id %u)",
+        _owner->GetPlayer()->GetName().c_str(), _activeMover->GetName().c_str(), _activeMover->GetGUID().ToString().c_str(), _pendingActiveMoverSplineId);
+#else
+    if (IsAllowedToTakeControl(activeMover->GetGUID()))
+    {
+        AllowMover(activeMover);
+        TC_LOG_TRACE("movement", "WorldSession::SetActiveMover: Enabling move of unit %s (%s) to player %s (%s)",
+            activeMover->GetName().c_str(), activeMover->GetGUID().ToString().c_str(), _owner->GetPlayer()->GetName().c_str(), _owner->GetPlayer()->GetName().c_str());
+    }
+    else
+    {
+        TC_LOG_ERROR("movement", "WorldSession::SetActiveMover: Failed enabling move of unit %s (%s) to player %s (%s), pending spline id is correct but player is not allowed to take control anymore",
+            activeMover->GetName().c_str(), activeMover->GetGUID().ToString().c_str(), _owner->GetPlayer()->GetName().c_str(), _owner->GetPlayer()->GetName().c_str());
+    }
+#endif
+}
+
+void ClientControl::PlayerDisconnect()
+{
+    if (Unit* u = _serverActiveMover.unit.lock().get())
+    {
+        ASSERT(u->m_playerMovingMe.lock().get() == this);
+        u->m_playerMovingMe.reset();
+        _serverActiveMover.Reset();
+    }
+}
+
+void ClientControl::ResetActiveMover()
+{
+    Unit* previousMover = _activeMover.lock().get();
+    _activeMover.reset();
+    _owner->anticheat.OnPlayerMoverChanged(previousMover, nullptr);
+}
+
 void ClientControl::ClientSetActiveMover(ObjectGuid guid)
 {
-    if (_activeMover && _activeMover->GetGUID() == guid)
+    Unit* activeMover = _activeMover.lock().get();
+    if (activeMover && activeMover->GetGUID() == guid)
         return; //we already control this unit, ignore
 
     if (!IsAllowedToTakeControl(guid))
@@ -303,8 +301,6 @@ void ClientControl::ClientSetActiveMover(ObjectGuid guid)
         TC_LOG_ERROR("movement", "WorldSession::HandleSetActiveMoverOpcode: The client of player %s doesn't have the permission to control this unit (GUID: %s)!", _owner->GetPlayer()->GetName().c_str(), guid.ToString().c_str());
         return;
     }
-
-    _releaseMoverTimeout = 0;
 
     Unit* mover = ObjectAccessor::GetUnit(*_owner->GetPlayer(), guid);
     if (!mover)
@@ -316,50 +312,40 @@ void ClientControl::ClientSetActiveMover(ObjectGuid guid)
     TC_LOG_TRACE("movement", "CMSG_SET_ACTIVE_MOVER: Player %s, setting unit %s as active mover",
         _owner->GetPlayer()->GetName().c_str(), mover->GetName().c_str());
 
-#ifndef LICH_KING
-    //On LK, client may have multiple active movers
     ResetActiveMover();
-#endif
     SetActiveMover(mover);
 }
 
 void ClientControl::ClientSetNotActiveMover(MovementInfo& movementInfo)
 {
-    _releaseMoverTimeout = 0;
-    if (!_activeMover)
+    Unit* mover = _activeMover.lock().get();
+    if (!mover)
     {
         TC_LOG_ERROR("movement", "WorldSession::HandleMoveNotActiveMover: The client doesn't control any unit right now");
         return;
     }
+    ResetActiveMover();
 
-    if (_activeMover->GetGUID() != movementInfo.guid)
+    if (mover->GetGUID() != movementInfo.guid)
     {
         TC_LOG_ERROR("movement", "WorldSession::HandleMoveNotActiveMover: The client is trying to desactive an unit which is not the active mover?");
         return;
     }
 
     TC_LOG_TRACE("movement", "CMSG_MOVE_NOT_ACTIVE_MOVER: Player %s, removing unit %s from active mover",
-        _owner->GetPlayer()->GetName().c_str(), _activeMover->GetName().c_str());
+        _owner->GetPlayer()->GetName().c_str(), mover->GetName().c_str());
 
     //It may be that another player already took control, we don't want to update mover movement info in that case
     if (IsAllowedToMove(movementInfo.guid, false))
     {
-        if (Unit* mover = ObjectAccessor::GetUnit(*_owner->GetPlayer(), movementInfo.guid))
-        {
-            mover->ValidateMovementInfo(&movementInfo);
-            movementInfo.flags &= ~MOVEMENTFLAG_MASK_MOVING; //remove any moving flag, else we'll have unit rubber banding until someone else takes control of it
-            mover->UpdateMovementInfo(movementInfo);
-            //send move (not sure which opcode is sent for this)
-            WorldPacket data(MSG_MOVE_STOP, sizeof(MovementInfo));
-            mover->GetMovementInfo().WriteContentIntoPacket(&data, true);  //this contains the server time, not the time provided by client
-            mover->SendMessageToSet(&data, _owner->GetPlayer());
-        }
-        else
-            TC_LOG_ERROR("entities.unit", "WorldSession::HandleMoveNotActiveMover: Did not find active mover %s",
-                movementInfo.guid.ToString().c_str());
+        mover->ValidateMovementInfo(&movementInfo);
+        movementInfo.flags &= ~MOVEMENTFLAG_MASK_MOVING; //remove any moving flag, else we'll have unit rubber banding until someone else takes control of it
+        mover->UpdateMovementInfo(movementInfo);
+        //send move (not sure which opcode is sent for this)
+        WorldPacket data(MSG_MOVE_STOP, sizeof(MovementInfo));
+        mover->GetMovementInfo().WriteContentIntoPacket(&data, true);  //this contains the server time, not the time provided by client
+        mover->SendMessageToSet(&data, _owner->GetPlayer());
     }
-
-    ResetActiveMover();
 }
 
 void ClientControl::AllowTakeControl(Unit* target, bool charm)
@@ -368,11 +354,17 @@ void ClientControl::AllowTakeControl(Unit* target, bool charm)
     _allowedClientControl.insert(target->GetGUID());
     //from this point, client is allowed to take control of the unit using CMSG_SET_ACTIVE_MOVER, but is not yet allowed to move it
 
-    //Todo: control suppression
-    bool suppressed = false;
-    bool takeControlImmediately = !suppressed && (charm || !_activeMover);
-    if(takeControlImmediately)
-        SetClientControl(target, true);
+    bool takeControlImmediately = charm || _serverActiveMover.unit.expired();
+    if (takeControlImmediately)
+    {
+        // Set viewpoint
+        if (target == _owner->GetPlayer())
+            _owner->GetPlayer()->SetGuidValue(PLAYER_FARSIGHT, ObjectGuid::Empty);
+        else
+            _owner->GetPlayer()->SetViewpoint(target, true); //Setting PLAYER_FARSIGHT will trigger CMSG_FAR_SIGHT from client (which will have no effect here since we already set vision in SetViewpoint)
+
+        UpdateTakeControl(target, true);
+    }
 }
 
 void ClientControl::DisallowTakeControl(Unit* target)
@@ -380,27 +372,34 @@ void ClientControl::DisallowTakeControl(Unit* target)
     _allowedClientControl.erase(target->GetGUID());
     //from this point, client not allowed to take the unit anymore using CMSG_SET_ACTIVE_MOVER, but may still be able to move/ack it until another player actives the unit as mover
 
-    //Todo: control suppression
-    if (_activeMover)
+    if (Unit* mover = _serverActiveMover.unit.lock().get())
     {
         // if we had this target as active mover, send remove control
-        if (_activeMover == target)
+        if (mover == target)
         {
-            SetClientControl(target, false);
-            _releaseMoverTimeout = sWorld->getIntConfig(CONFIG_PENDING_MOVE_CHANGES_TIMEOUT);
+            UpdateTakeControl(target, false);
 
             // Also restore control to first other unit we can control
             if (!_allowedClientControl.empty())
             {
                 if (Unit* mover = ObjectAccessor::GetUnit(*_owner->GetPlayer(), *(_allowedClientControl.begin())))
-                    SetClientControl(mover, true);
+                    UpdateTakeControl(mover, true);
             }
         }
     }
+
+    if (_owner->GetPlayer()->GetGuidValue(PLAYER_FARSIGHT) == target->GetGUID())
+        _owner->GetPlayer()->SetViewpoint(target, false);
 }
 
-void ClientControl::SuppressMover(Unit* target, bool apply)
+void ClientControl::UpdateSuppressedMover(Unit* target)
 {
-    //Todo: control suppression
-    SetClientControl(target, !apply);
+    ASSERT(_serverActiveMover.unit.lock().get() == target);
+    ASSERT(target->m_playerMovingMe.lock().get() == this);
+    bool suppressed = target->IsMoverSuppressed();
+    if (_serverActiveMover.suppressed != suppressed) //if suppressed state changed, update client control
+    {
+        SetClientControl(target, !suppressed);
+        _serverActiveMover.suppressed = suppressed;
+    }
 }

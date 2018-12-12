@@ -2809,10 +2809,11 @@ void Spell::TargetInfo::DoDamageAndTriggers(Spell* spell)
     if (MissCondition != SPELL_MISS_NONE && spell->m_needComboPoints && spell->m_targets.GetUnitTargetGUID() == TargetGUID)
         spell->m_needComboPoints = false;
 
-    // _spellHitTarget can be null if spell is missed in DoSpellHitOnUnit
-    if (MissCondition != SPELL_MISS_EVADE && _spellHitTarget && !spell->m_caster->IsFriendlyTo(unit) && (!spell->IsPositive() || spell->m_spellInfo->HasEffect(SPELL_EFFECT_DISPEL)))
+    // sun: trigger this block even if we missed target //_spellHitTarget can be null if spell is missed in DoSpellHitOnUnit
+    if (MissCondition != SPELL_MISS_EVADE && /*_spellHitTarget && */ !spell->m_caster->IsFriendlyTo(unit) && (!spell->IsPositive() || spell->m_spellInfo->HasEffect(SPELL_EFFECT_DISPEL)))
     {
-        if (!spell->IsTriggered()) //sun: prevent triggered spells to trigger pvp... a frost armor proc is not an offensive action
+        //sun: prevent triggered spells to trigger pvp... a frost armor proc is not an offensive action. But we also want it to proc for some direct trigger spells such as charge stun.
+        if (!spell->m_triggeredByAuraSpell || !unit->IsCharmedOwnedByPlayerOrPlayer()) 
             if (Unit* uCaster = spell->m_caster->ToUnit())
                 uCaster->AttackedTarget(unit, spell->m_spellInfo->HasInitialAggro());
 
@@ -3879,7 +3880,7 @@ uint32 Spell::GetChannelStartDuration() const
         // 1 - Get first spell effect needing explicit target
         uint8 i = EFFECT_0;
         bool unused, unused2;
-        for (; ; i++)
+        for (; i < MAX_SPELL_EFFECTS; i++)
         {
             auto effect = m_spellInfo->Effects[i];
             if (!effect.IsEffect() || !effect.IsAura())
@@ -3887,10 +3888,10 @@ uint32 Spell::GetChannelStartDuration() const
 
             if (effect.TargetA.GetExplicitTargetMask(unused, unused2) & TARGET_FLAG_UNIT_MASK)
                 break;
-
-            if (i >= MAX_SPELL_EFFECTS)
-                return 0;
         }
+
+        if (i >= MAX_SPELL_EFFECTS)
+            return 0;
 
         // 2 - Select first target unit with this effect applied as channel target
         Unit const* channelTarget = nullptr;
@@ -7931,19 +7932,22 @@ void Spell::HandleLaunchPhase()
 
 void Spell::DoEffectOnLaunchTarget(TargetInfo& targetInfo, float multiplier, uint8 effIndex)
 {
+    //sun: rewritten SetInCombat logic, else target wasn't set in combat if spell was missed/resisted/...
     Unit* unit = nullptr;
+    Unit* targetedUnit = m_caster->GetGUID() == targetInfo.TargetGUID ? m_caster->ToUnit() : ObjectAccessor::GetUnit(*m_caster, targetInfo.TargetGUID);
     // In case spell hit target, do all effect on that target
     if (targetInfo.MissCondition == SPELL_MISS_NONE)
-        unit = m_caster->GetGUID() == targetInfo.TargetGUID ? m_caster->ToUnit() : ObjectAccessor::GetUnit(*m_caster, targetInfo.TargetGUID);
+        unit = targetedUnit; 
     // In case spell reflect from target, do all effect on caster (if hit)
     else if (targetInfo.MissCondition == SPELL_MISS_REFLECT && targetInfo.ReflectResult == SPELL_MISS_NONE)
         unit = m_caster->ToUnit();
-    if (!unit)
-        return;
 
     // This will only cause combat - the target will engage once the projectile hits (in DoAllEffectOnTarget)
-    if (m_originalCaster && targetInfo.MissCondition != SPELL_MISS_EVADE && !m_originalCaster->IsFriendlyTo(unit) && (!m_spellInfo->IsPositive() || m_spellInfo->HasEffect(SPELL_EFFECT_DISPEL)) && (m_spellInfo->HasInitialAggro() || unit->IsEngaged()))
-        m_originalCaster->SetInCombatWith(unit);
+    if (m_originalCaster && targetInfo.MissCondition != SPELL_MISS_EVADE && !m_originalCaster->IsFriendlyTo(targetedUnit) && (!m_spellInfo->IsPositive() || m_spellInfo->HasEffect(SPELL_EFFECT_DISPEL)) && (m_spellInfo->HasInitialAggro() || targetedUnit->IsEngaged()))
+        m_originalCaster->SetInCombatWith(targetedUnit);
+
+    if (!unit)
+        return;
 
     m_damage = 0;
     m_healing = 0;
